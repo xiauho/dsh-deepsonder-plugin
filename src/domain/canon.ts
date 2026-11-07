@@ -1,9 +1,8 @@
-import { promises as fs } from 'node:fs'
-import type { Dirent } from 'node:fs'
 import path from 'node:path'
 
 import { DomainError } from './errors.js'
-import { pathExists, readText, resolveInside, sha256, toPosix, writeTextAtomic } from './paths.js'
+import { sha256 } from './paths.js'
+import { ProjectStore } from './project-store.js'
 
 export type CanonKind = 'character' | 'world' | 'power' | 'timeline' | 'plan' | 'doc'
 export type CanonFormat = 'markdown' | 'json'
@@ -14,11 +13,13 @@ export interface CanonEntry {
   title: string
   path: string
   format: CanonFormat
+  version?: string
 }
 
 export interface CanonDoc extends CanonEntry {
   raw: string
   sha256: string
+  version: string
 }
 
 const KIND_ORDER: Record<CanonKind, number> = {
@@ -68,70 +69,52 @@ function isAllowedCanonPath(relativePath: string): boolean {
   return normalized.startsWith('canon/') || normalized === 'outline/story_plan.json'
 }
 
-function describe(relativePath: string, raw?: string): CanonEntry {
+function toPosix(value: string): string {
+  return value.replace(/\\/g, '/')
+}
+
+function describe(relativePath: string, raw?: string, version?: string): CanonEntry {
   return {
     id: idFor(relativePath),
     kind: classify(relativePath),
     title: titleFor(relativePath, raw),
     path: toPosix(relativePath),
     format: formatOf(relativePath),
+    version,
   }
 }
 
-async function walk(directory: string): Promise<string[]> {
-  let entries: Dirent[]
-  try {
-    entries = await fs.readdir(directory, { withFileTypes: true })
-  } catch {
-    return []
-  }
+async function walk(store: ProjectStore, directory: string): Promise<string[]> {
+  const entries = await store.listDir(directory)
   const files: string[] = []
   for (const entry of entries) {
-    const fullPath = path.join(directory, entry.name)
-    if (entry.isDirectory()) {
-      files.push(...(await walk(fullPath)))
-    } else if (entry.isFile()) {
-      files.push(fullPath)
+    if (entry.type === 'directory') {
+      files.push(...(await walk(store, entry.relativePath)))
+    } else if (entry.type === 'file') {
+      files.push(entry.relativePath)
     }
   }
   return files
 }
 
-export async function listCanon(root: string): Promise<CanonEntry[]> {
+export async function listCanon(store: ProjectStore): Promise<CanonEntry[]> {
   const entries: CanonEntry[] = []
-  const canonDirectory = resolveInside(root, 'canon')
-  const files = await walk(canonDirectory)
+  const files = await walk(store, 'canon')
 
-  for (const fullPath of files) {
-    if (!fullPath.toLowerCase().endsWith('.md')) continue
-    const relative = toPosix(path.relative(path.resolve(root), fullPath))
-    if (relative === 'canon/timeline.md') {
-      let raw = ''
-      try {
-        raw = await readText(fullPath)
-      } catch {
-        // 读不到的文档不进入列表，避免 UI 打开空文件。
-        continue
-      }
-      entries.push(describe(relative, raw))
-      continue
-    }
-    let raw = ''
+  for (const relativePath of files) {
+    if (!relativePath.toLowerCase().endsWith('.md')) continue
     try {
-      raw = await readText(fullPath)
+      const current = await store.readText(relativePath)
+      entries.push(describe(relativePath, current.raw, current.version))
     } catch {
-      continue
+      // 读不到的文档不进入列表。
     }
-    entries.push(describe(relative, raw))
   }
 
-  const timelineJson = resolveInside(root, 'canon/timeline_events.json')
-  if (await pathExists(timelineJson)) {
+  if (await store.exists('canon/timeline_events.json')) {
     entries.push(describe('canon/timeline_events.json'))
   }
-
-  const storyPlan = resolveInside(root, 'outline/story_plan.json')
-  if (await pathExists(storyPlan)) {
+  if (await store.exists('outline/story_plan.json')) {
     entries.push(describe('outline/story_plan.json'))
   }
 
@@ -142,28 +125,25 @@ export async function listCanon(root: string): Promise<CanonEntry[]> {
   })
 }
 
-export async function readCanonDoc(root: string, relativePath: string): Promise<CanonDoc> {
+export async function readCanonDoc(store: ProjectStore, relativePath: string): Promise<CanonDoc> {
   if (!isAllowedCanonPath(relativePath)) {
     throw new DomainError('invalid_canon_path', '只能读取 canon/ 或故事规划文件。')
   }
-  const fullPath = resolveInside(root, relativePath)
-  if (!(await pathExists(fullPath))) {
-    throw new DomainError('canon_not_found', `找不到资料文件：${relativePath}`, 404)
-  }
-  const raw = await readText(fullPath)
+  const current = await store.readText(toPosix(relativePath))
   return {
-    ...describe(relativePath, raw),
-    raw,
-    sha256: sha256(raw),
+    ...describe(relativePath, current.raw, current.version),
+    raw: current.raw,
+    sha256: sha256(current.raw),
+    version: current.version,
   }
 }
 
 export async function saveCanonDoc(
-  root: string,
+  store: ProjectStore,
   relativePath: string,
   raw: string,
-  expectedSha?: string,
-): Promise<{ sha256: string }> {
+  expectedVersion?: string,
+): Promise<{ sha256: string; version: string }> {
   if (!isAllowedCanonPath(relativePath)) {
     throw new DomainError('invalid_canon_path', '只能保存 canon/ 或故事规划文件。')
   }
@@ -174,14 +154,6 @@ export async function saveCanonDoc(
       throw new DomainError('invalid_json', 'JSON 内容无法解析，未保存。')
     }
   }
-  const fullPath = resolveInside(root, relativePath)
-  if (!(await pathExists(fullPath))) {
-    throw new DomainError('canon_not_found', `找不到资料文件：${relativePath}`, 404)
-  }
-  const current = await readText(fullPath)
-  if (expectedSha && sha256(current) !== expectedSha) {
-    throw new DomainError('conflict', '资料文件已被其他程序修改，请重新载入后再保存。', 409)
-  }
-  await writeTextAtomic(fullPath, raw)
-  return { sha256: sha256(raw) }
+  const result = await store.writeText(toPosix(relativePath), raw, expectedVersion)
+  return { sha256: sha256(raw), version: result.version }
 }

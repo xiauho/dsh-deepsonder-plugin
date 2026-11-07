@@ -1,10 +1,17 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
 
-import { readCanonDoc, listCanon, saveCanonDoc } from '../domain/canon.js'
-import { readChapter, saveChapter } from '../domain/chapter.js'
+import { listCanon, readCanonDoc, saveCanonDoc } from '../domain/canon.js'
+import {
+  createChapter,
+  readChapter,
+  renameChapterTitle,
+  reorderChapters,
+  saveChapter,
+} from '../domain/chapter.js'
 import { DomainError } from '../domain/errors.js'
-import { openProject } from '../domain/project.js'
-import { listTrash, restoreTrash } from '../domain/trash.js'
+import { FsPortError } from '../domain/fs-port.js'
+import { listTrash, moveChapterToTrash, restoreTrash } from '../domain/trash.js'
+import { ProjectManager } from './project-manager.js'
 
 interface RouteSpec {
   kind: 'exact' | 'prefix'
@@ -61,6 +68,16 @@ function bodyString(body: Record<string, unknown>, name: string): string {
   return typeof value === 'string' ? value : ''
 }
 
+function bodyBoolean(body: Record<string, unknown>, name: string): boolean {
+  return body[name] === true
+}
+
+function bodyStringArray(body: Record<string, unknown>, name: string): string[] {
+  const value = body[name]
+  if (!Array.isArray(value)) return []
+  return value.filter((item): item is string => typeof item === 'string')
+}
+
 type Handler = (req: IncomingMessage, res: ServerResponse, url: URL) => Promise<void>
 
 function exact(path: string, method: string, handler: Handler): RouteSpec {
@@ -78,6 +95,26 @@ function exact(path: string, method: string, handler: Handler): RouteSpec {
           sendJson(res, error.status, { error: error.message, code: error.code })
           return
         }
+        if (error instanceof FsPortError) {
+          if (error.code === 'FS_SANDBOX_DENIED') {
+            sendJson(res, 403, {
+              error:
+                '项目目录不在当前 DSH 工作区的可写范围内。请把项目添加为 DSH 工作区，或在 DSH 中允许完整文件访问。',
+              code: error.code,
+            })
+            return
+          }
+          if (error.code === 'FS_NOT_FOUND') {
+            sendJson(res, 404, { error: error.message, code: error.code })
+            return
+          }
+          if (error.code === 'FS_STALE_VERSION' || error.code === 'FS_NOT_OBSERVED') {
+            sendJson(res, 409, { error: error.message, code: error.code })
+            return
+          }
+          sendJson(res, 500, { error: error.message, code: error.code })
+          return
+        }
         const message = error instanceof Error ? error.message : String(error)
         sendJson(res, 500, { error: message, code: 'internal_error' })
       })
@@ -85,7 +122,7 @@ function exact(path: string, method: string, handler: Handler): RouteSpec {
   }
 }
 
-export function registerRoutes(webServer: WebServer): () => void {
+export function registerRoutes(webServer: WebServer, manager: ProjectManager): () => void {
   const disposers: Array<() => void> = []
 
   disposers.push(
@@ -94,7 +131,7 @@ export function registerRoutes(webServer: WebServer): () => void {
         sendJson(res, 200, {
           ok: true,
           plugin: 'deepsonder',
-          stage: 'phase-0',
+          stage: 'phase-1',
           time: new Date().toISOString(),
         })
       }),
@@ -105,8 +142,20 @@ export function registerRoutes(webServer: WebServer): () => void {
     webServer.register(
       exact('/deepsonder/project/open', 'POST', async (req, res) => {
         const body = await readBody(req)
-        const summary = await openProject(bodyString(body, 'root'))
+        const summary = await manager.open(
+          bodyString(body, 'root'),
+          bodyBoolean(body, 'force'),
+        )
         sendJson(res, 200, summary)
+      }),
+    ),
+  )
+
+  disposers.push(
+    webServer.register(
+      exact('/deepsonder/project/close', 'POST', async (_req, res) => {
+        await manager.close()
+        sendJson(res, 200, { ok: true })
       }),
     ),
   )
@@ -114,8 +163,8 @@ export function registerRoutes(webServer: WebServer): () => void {
   disposers.push(
     webServer.register(
       exact('/deepsonder/project/summary', 'GET', async (_req, res, url) => {
-        const summary = await openProject(queryParam(url, 'root'))
-        sendJson(res, 200, summary)
+        manager.require(queryParam(url, 'root'))
+        sendJson(res, 200, await manager.refresh())
       }),
     ),
   )
@@ -123,8 +172,8 @@ export function registerRoutes(webServer: WebServer): () => void {
   disposers.push(
     webServer.register(
       exact('/deepsonder/chapter', 'GET', async (_req, res, url) => {
-        const chapter = await readChapter(queryParam(url, 'root'), queryParam(url, 'id'))
-        sendJson(res, 200, chapter)
+        const { store } = manager.require(queryParam(url, 'root'))
+        sendJson(res, 200, await readChapter(store, queryParam(url, 'id')))
       }),
     ),
   )
@@ -133,11 +182,13 @@ export function registerRoutes(webServer: WebServer): () => void {
     webServer.register(
       exact('/deepsonder/chapter/save', 'POST', async (req, res) => {
         const body = await readBody(req)
+        const { store } = manager.require(bodyString(body, 'root'))
+        await manager.touch()
         const result = await saveChapter(
-          bodyString(body, 'root'),
+          store,
           bodyString(body, 'id'),
           bodyString(body, 'raw'),
-          bodyString(body, 'expectedSha') || undefined,
+          bodyString(body, 'expectedVersion') || undefined,
         )
         sendJson(res, 200, result)
       }),
@@ -146,10 +197,66 @@ export function registerRoutes(webServer: WebServer): () => void {
 
   disposers.push(
     webServer.register(
+      exact('/deepsonder/chapter/create', 'POST', async (req, res) => {
+        const body = await readBody(req)
+        const { store } = manager.require(bodyString(body, 'root'))
+        await manager.touch()
+        const chapter = await createChapter(
+          store,
+          bodyString(body, 'title'),
+          bodyString(body, 'id') || undefined,
+        )
+        sendJson(res, 200, chapter)
+      }),
+    ),
+  )
+
+  disposers.push(
+    webServer.register(
+      exact('/deepsonder/chapter/rename', 'POST', async (req, res) => {
+        const body = await readBody(req)
+        const { store } = manager.require(bodyString(body, 'root'))
+        await manager.touch()
+        const chapter = await renameChapterTitle(
+          store,
+          bodyString(body, 'id'),
+          bodyString(body, 'title'),
+          bodyString(body, 'expectedVersion') || undefined,
+        )
+        sendJson(res, 200, chapter)
+      }),
+    ),
+  )
+
+  disposers.push(
+    webServer.register(
+      exact('/deepsonder/chapter/reorder', 'POST', async (req, res) => {
+        const body = await readBody(req)
+        const { store } = manager.require(bodyString(body, 'root'))
+        await manager.touch()
+        const chapters = await reorderChapters(store, bodyStringArray(body, 'orderedIds'))
+        sendJson(res, 200, { chapters })
+      }),
+    ),
+  )
+
+  disposers.push(
+    webServer.register(
+      exact('/deepsonder/chapter/delete', 'POST', async (req, res) => {
+        const body = await readBody(req)
+        const { store } = manager.require(bodyString(body, 'root'))
+        await manager.touch()
+        const entry = await moveChapterToTrash(store, bodyString(body, 'id'))
+        sendJson(res, 200, entry)
+      }),
+    ),
+  )
+
+  disposers.push(
+    webServer.register(
       exact('/deepsonder/canon', 'GET', async (_req, res, url) => {
-        const root = queryParam(url, 'root')
-        if (!root) throw new DomainError('invalid_root', '请填写项目目录。')
-        sendJson(res, 200, { entries: await listCanon(root) })
+        const { store } = manager.require(queryParam(url, 'root'))
+        sendJson(res, 200, { entries: await listCanon(store) })
       }),
     ),
   )
@@ -157,8 +264,8 @@ export function registerRoutes(webServer: WebServer): () => void {
   disposers.push(
     webServer.register(
       exact('/deepsonder/canon/doc', 'GET', async (_req, res, url) => {
-        const doc = await readCanonDoc(queryParam(url, 'root'), queryParam(url, 'path'))
-        sendJson(res, 200, doc)
+        const { store } = manager.require(queryParam(url, 'root'))
+        sendJson(res, 200, await readCanonDoc(store, queryParam(url, 'path')))
       }),
     ),
   )
@@ -167,11 +274,13 @@ export function registerRoutes(webServer: WebServer): () => void {
     webServer.register(
       exact('/deepsonder/canon/save', 'POST', async (req, res) => {
         const body = await readBody(req)
+        const { store } = manager.require(bodyString(body, 'root'))
+        await manager.touch()
         const result = await saveCanonDoc(
-          bodyString(body, 'root'),
+          store,
           bodyString(body, 'path'),
           bodyString(body, 'raw'),
-          bodyString(body, 'expectedSha') || undefined,
+          bodyString(body, 'expectedVersion') || undefined,
         )
         sendJson(res, 200, result)
       }),
@@ -181,9 +290,8 @@ export function registerRoutes(webServer: WebServer): () => void {
   disposers.push(
     webServer.register(
       exact('/deepsonder/trash', 'GET', async (_req, res, url) => {
-        const root = queryParam(url, 'root')
-        if (!root) throw new DomainError('invalid_root', '请填写项目目录。')
-        sendJson(res, 200, { entries: await listTrash(root) })
+        const { store } = manager.require(queryParam(url, 'root'))
+        sendJson(res, 200, { entries: await listTrash(store) })
       }),
     ),
   )
@@ -192,7 +300,9 @@ export function registerRoutes(webServer: WebServer): () => void {
     webServer.register(
       exact('/deepsonder/trash/restore', 'POST', async (req, res) => {
         const body = await readBody(req)
-        const result = await restoreTrash(bodyString(body, 'root'), bodyString(body, 'trashId'))
+        const { store } = manager.require(bodyString(body, 'root'))
+        await manager.touch()
+        const result = await restoreTrash(store, bodyString(body, 'trashId'))
         sendJson(res, 200, result)
       }),
     ),

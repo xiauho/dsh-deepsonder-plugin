@@ -1,6 +1,6 @@
 {
   "name": "dsh-deepsonder-plugin",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "private": true,
   "description": "DeepSonder desktop plugin for DeepSeek Harness: project canon, writing desk, recycle bin, and DSH-native AI assistance.",
   "license": "MIT",

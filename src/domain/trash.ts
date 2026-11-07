@@ -1,17 +1,8 @@
-import { promises as fs } from 'node:fs'
-import type { Dirent } from 'node:fs'
-import path from 'node:path'
+import { randomUUID } from 'node:crypto'
 
 import { DomainError } from './errors.js'
-import {
-  pathExists,
-  readJson,
-  readText,
-  resolveInside,
-  toPosix,
-  writeJsonAtomic,
-  writeTextAtomic,
-} from './paths.js'
+import { ProjectStore } from './project-store.js'
+import { readChapter } from './chapter.js'
 
 export type TrashKind = 'chapter' | 'character' | 'canon'
 
@@ -42,6 +33,7 @@ const TRASH_ROOTS: TrashRoot[] = [
 ]
 
 const RESERVED_TRASH_DIRECTORIES = new Set(['characters', 'canon'])
+const CHAPTER_SUMMARIES_PATH = 'memory/chapter_summaries.json'
 
 function stringField(manifest: RawManifest, key: string): string {
   const value = manifest[key]
@@ -56,13 +48,13 @@ function readEntry(manifest: RawManifest, folder: string, kind: TrashKind): Tras
   const trashId = stringField(manifest, 'trash_id')
   const originalPath = stringField(manifest, 'original_path')
   const deletedAt = stringField(manifest, 'deleted_at')
-  if (!trashId || path.basename(folder) !== trashId || !originalPath || !deletedAt) {
+  if (!trashId || folder.split('/').at(-1) !== trashId || !originalPath || !deletedAt) {
     return null
   }
   return {
     trashId,
     kind,
-    title: stringField(manifest, 'title') || path.basename(originalPath).replace(/\.md$/i, ''),
+    title: stringField(manifest, 'title') || originalPath.split('/').at(-1)?.replace(/\.md$/i, '') || trashId,
     originalPath: normalizeRelative(originalPath),
     deletedAt,
     hasSummary: manifest.has_summary === true,
@@ -71,33 +63,33 @@ function readEntry(manifest: RawManifest, folder: string, kind: TrashKind): Tras
   }
 }
 
-export async function listTrash(root: string): Promise<TrashEntry[]> {
+async function safeListDir(store: ProjectStore, directory: string) {
+  try {
+    return await store.listDir(directory)
+  } catch {
+    return []
+  }
+}
+
+export async function listTrash(store: ProjectStore): Promise<TrashEntry[]> {
   const entries: TrashEntry[] = []
 
   for (const rootSpec of TRASH_ROOTS) {
-    const directory = resolveInside(root, rootSpec.directory)
-    let children: Dirent[]
-    try {
-      children = await fs.readdir(directory, { withFileTypes: true })
-    } catch {
-      continue
-    }
-
+    const children = await safeListDir(store, rootSpec.directory)
     for (const child of children) {
-      if (!child.isDirectory()) continue
+      if (child.type !== 'directory') continue
       if (rootSpec.kind === 'chapter' && RESERVED_TRASH_DIRECTORIES.has(child.name)) continue
-      const folder = path.join(directory, child.name)
-      const manifestPath = path.join(folder, 'manifest.json')
-      if (!(await pathExists(manifestPath))) continue
-      let manifest: RawManifest
+      const manifestPath = `${child.relativePath}/manifest.json`
+      if (!(await store.exists(manifestPath))) continue
       try {
-        manifest = await readJson<RawManifest>(manifestPath)
+        const current = await store.readText(manifestPath)
+        const manifest = JSON.parse(current.raw) as RawManifest
+        if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)) continue
+        const entry = readEntry(manifest, child.relativePath, rootSpec.kind)
+        if (entry) entries.push(entry)
       } catch {
-        continue
+        // 单个损坏条目不影响其余回收站内容。
       }
-      if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)) continue
-      const entry = readEntry(manifest, folder, rootSpec.kind)
-      if (entry) entries.push(entry)
     }
   }
 
@@ -119,85 +111,125 @@ function assertEntryId(value: string, label: string): string {
   return value
 }
 
-async function removeTrashFolder(folder: string): Promise<void> {
-  await fs.rm(folder, { recursive: true, force: true })
+async function readJsonValueOptional(
+  store: ProjectStore,
+  relativePath: string,
+): Promise<{ value: unknown; version?: string }> {
+  if (!(await store.exists(relativePath))) return { value: null }
+  const current = await store.readText(relativePath)
+  try {
+    return { value: JSON.parse(current.raw) as unknown, version: current.version }
+  } catch {
+    throw new DomainError('invalid_json', `无法解析 JSON 文件：${relativePath}`, 500)
+  }
 }
 
-async function restoreChapter(root: string, entry: TrashEntry): Promise<string> {
-  const chapterId = assertEntryId(stringField(entry.manifest, 'chapter_id'), '章节标识')
-  const relativePath = `outline/chapters/${chapterId}.md`
-  const target = resolveInside(root, relativePath)
-  if (await pathExists(target)) {
-    throw new DomainError('conflict', `章节 ${chapterId} 已存在，无法恢复。`, 409)
+async function readJsonOptional(
+  store: ProjectStore,
+  relativePath: string,
+): Promise<{ data: Record<string, unknown>; version?: string }> {
+  const current = await readJsonValueOptional(store, relativePath)
+  return {
+    data:
+      current.value && typeof current.value === 'object' && !Array.isArray(current.value)
+        ? (current.value as Record<string, unknown>)
+        : {},
+    version: current.version,
   }
+}
 
-  const source = path.join(entry.folder, 'chapter.md')
-  if (!(await pathExists(source))) {
-    throw new DomainError('trash_corrupt', '回收站中的章节正文缺失。', 500)
+async function writeJsonOptional(
+  store: ProjectStore,
+  relativePath: string,
+  data: unknown,
+  version?: string,
+): Promise<void> {
+  const content = `${JSON.stringify(data, null, 2)}\n`
+  if (version) {
+    await store.writeText(relativePath, content, version, { backup: false })
+  } else {
+    await store.createText(relativePath, content)
   }
-  const chapterText = await readText(source)
-  await writeTextAtomic(target, chapterText)
+}
 
-  if (entry.hasSummary) {
-    const summaryPath = path.join(entry.folder, 'summary.json')
-    if (await pathExists(summaryPath)) {
-      try {
-        const summary = await readJson<unknown>(summaryPath)
-        const summariesPath = resolveInside(root, 'memory/chapter_summaries.json')
-        let summaries: Record<string, unknown> = {}
-        if (await pathExists(summariesPath)) {
-          summaries = await readJson<Record<string, unknown>>(summariesPath)
-        }
-        summaries[chapterId] = summary
-        await writeJsonAtomic(summariesPath, summaries)
-      } catch (error) {
-        await fs.rm(target, { force: true })
-        throw error
-      }
+async function removeTrashEntryFiles(store: ProjectStore, folder: string): Promise<void> {
+  const entries = await safeListDir(store, folder)
+  const manifest = entries.find((entry) => entry.name === 'manifest.json')
+  if (manifest) {
+    try {
+      await store.deleteFile(manifest.relativePath)
+    } catch {
+      // 清单删除失败时保留其余文件，避免出现半删除状态。
+      return
     }
   }
-
-  await removeTrashFolder(entry.folder)
-  return toPosix(relativePath)
+  for (const entry of entries) {
+    if (entry.type !== 'file' || entry.name === 'manifest.json') continue
+    try {
+      await store.deleteFile(entry.relativePath)
+    } catch {
+      // 单个文件删除失败不阻塞其他清理。
+    }
+  }
 }
 
-async function restoreCharacter(root: string, entry: TrashEntry): Promise<string> {
+async function restoreChapter(store: ProjectStore, entry: TrashEntry): Promise<string> {
+  const chapterId = assertEntryId(stringField(entry.manifest, 'chapter_id'), '章节标识')
+  const relativePath = `outline/chapters/${chapterId}.md`
+  if (await store.exists(relativePath)) {
+    throw new DomainError('conflict', `章节 ${chapterId} 已存在，无法恢复。`, 409)
+  }
+  const source = await store.readText(`${entry.folder}/chapter.md`)
+  await store.createText(relativePath, source.raw)
+
+  try {
+    if (entry.hasSummary && (await store.exists(`${entry.folder}/summary.json`))) {
+      const summary = await readJsonValueOptional(store, `${entry.folder}/summary.json`)
+      const summaries = await readJsonOptional(store, CHAPTER_SUMMARIES_PATH)
+      summaries.data[chapterId] = summary.value
+      await writeJsonOptional(store, CHAPTER_SUMMARIES_PATH, summaries.data, summaries.version)
+    }
+  } catch (error) {
+    await store.deleteFile(relativePath).catch(() => undefined)
+    throw error
+  }
+
+  await removeTrashEntryFiles(store, entry.folder)
+  return relativePath
+}
+
+async function restoreCharacter(store: ProjectStore, entry: TrashEntry): Promise<string> {
   const characterId = assertEntryId(stringField(entry.manifest, 'character_id'), '角色标识')
   const relativePath = `canon/characters/${characterId}.md`
-  const target = resolveInside(root, relativePath)
-  if (await pathExists(target)) {
+  if (await store.exists(relativePath)) {
     throw new DomainError('conflict', `角色 ${characterId} 已存在，无法恢复。`, 409)
   }
-  const source = path.join(entry.folder, 'character.md')
-  if (!(await pathExists(source))) {
-    throw new DomainError('trash_corrupt', '回收站中的角色卡缺失。', 500)
-  }
-  await writeTextAtomic(target, await readText(source))
-  await removeTrashFolder(entry.folder)
-  return toPosix(relativePath)
+  const source = await store.readText(`${entry.folder}/character.md`)
+  await store.createText(relativePath, source.raw)
+  await removeTrashEntryFiles(store, entry.folder)
+  return relativePath
 }
 
-async function restoreCanon(root: string, entry: TrashEntry): Promise<string> {
+async function restoreCanon(store: ProjectStore, entry: TrashEntry): Promise<string> {
   const originalPath = normalizeRelative(entry.originalPath)
   if (!originalPath.startsWith('canon/')) {
     throw new DomainError('invalid_trash_entry', '该资料不在 canon 目录内，拒绝恢复。')
   }
-  const target = resolveInside(root, originalPath)
-  if (await pathExists(target)) {
+  if (await store.exists(originalPath)) {
     throw new DomainError('conflict', `资料文件已存在，无法恢复：${originalPath}`, 409)
   }
-  const source = path.join(entry.folder, 'document.md')
-  if (!(await pathExists(source))) {
-    throw new DomainError('trash_corrupt', '回收站中的资料文档缺失。', 500)
-  }
-  await writeTextAtomic(target, await readText(source))
-  await removeTrashFolder(entry.folder)
+  const source = await store.readText(`${entry.folder}/document.md`)
+  await store.createText(originalPath, source.raw)
+  await removeTrashEntryFiles(store, entry.folder)
   return originalPath
 }
 
-export async function restoreTrash(root: string, trashId: string): Promise<{ restoredPath: string }> {
+export async function restoreTrash(
+  store: ProjectStore,
+  trashId: string,
+): Promise<{ restoredPath: string }> {
   const id = assertTrashId(trashId)
-  const entries = await listTrash(root)
+  const entries = await listTrash(store)
   const entry = entries.find((item) => item.trashId === id)
   if (!entry) {
     throw new DomainError('trash_not_found', `找不到回收站条目：${id}`, 404)
@@ -205,11 +237,80 @@ export async function restoreTrash(root: string, trashId: string): Promise<{ res
 
   let restoredPath: string
   if (entry.kind === 'chapter') {
-    restoredPath = await restoreChapter(root, entry)
+    restoredPath = await restoreChapter(store, entry)
   } else if (entry.kind === 'character') {
-    restoredPath = await restoreCharacter(root, entry)
+    restoredPath = await restoreCharacter(store, entry)
   } else {
-    restoredPath = await restoreCanon(root, entry)
+    restoredPath = await restoreCanon(store, entry)
   }
   return { restoredPath }
+}
+
+function trashStamp(): string {
+  return new Date()
+    .toISOString()
+    .replace(/[-:]/g, '')
+    .replace(/\.\d+Z$/, '')
+}
+
+export async function moveChapterToTrash(
+  store: ProjectStore,
+  chapterId: string,
+): Promise<TrashEntry> {
+  const chapter = await readChapter(store, chapterId)
+  const summaries = await readJsonOptional(store, CHAPTER_SUMMARIES_PATH)
+  const hadSummary = Object.prototype.hasOwnProperty.call(summaries.data, chapter.id)
+  const summaryValue = hadSummary ? summaries.data[chapter.id] : null
+
+  const trashId = `${trashStamp()}_${chapter.id}_${randomUUID().slice(0, 8)}`
+  const folder = `.novalist/trash/${trashId}`
+  const deletedAt = new Date().toISOString()
+  const manifest = {
+    trash_id: trashId,
+    chapter_id: chapter.id,
+    title: chapter.title,
+    original_path: chapter.path,
+    deleted_at: deletedAt,
+    has_summary: hadSummary,
+  }
+
+  await store.writeText(`${folder}/chapter.md`, chapter.raw, undefined, { backup: false })
+  await store.writeText(
+    `${folder}/summary.json`,
+    `${JSON.stringify(summaryValue, null, 2)}\n`,
+    undefined,
+    { backup: false },
+  )
+  await store.writeText(
+    `${folder}/manifest.json`,
+    `${JSON.stringify(manifest, null, 2)}\n`,
+    undefined,
+    { backup: false },
+  )
+
+  try {
+    if (hadSummary) {
+      const next = { ...summaries.data }
+      delete next[chapter.id]
+      await writeJsonOptional(store, CHAPTER_SUMMARIES_PATH, next, summaries.version)
+    }
+    await store.deleteFile(chapter.path, chapter.version)
+  } catch (error) {
+    await store.writeText(chapter.path, chapter.raw, undefined, { backup: false }).catch(() => undefined)
+    await writeJsonOptional(store, CHAPTER_SUMMARIES_PATH, summaries.data, summaries.version).catch(
+      () => undefined,
+    )
+    throw error
+  }
+
+  return {
+    trashId,
+    kind: 'chapter',
+    title: chapter.title,
+    originalPath: chapter.path,
+    deletedAt,
+    hasSummary: hadSummary,
+    folder,
+    manifest,
+  }
 }

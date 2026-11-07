@@ -12,11 +12,13 @@ interface ChapterSummary {
   title: string
   path: string
   order: number
+  version?: string
 }
 
 interface ChapterDoc extends ChapterSummary {
   raw: string
   sha256: string
+  version: string
   sections: {
     title: string
     outline: string
@@ -31,11 +33,13 @@ interface CanonEntry {
   title: string
   path: string
   format: 'markdown' | 'json'
+  version?: string
 }
 
 interface CanonDoc extends CanonEntry {
   raw: string
   sha256: string
+  version: string
 }
 
 interface TrashEntry {
@@ -187,6 +191,21 @@ const STYLES: Record<string, CSSProperties> = {
     lineHeight: '1.5',
     color: 'var(--dsw-alias-label-secondary, #8b949e)',
     overflowWrap: 'anywhere',
+  },
+  mini: {
+    padding: '2px 6px',
+    borderRadius: '4px',
+    border: '1px solid var(--dsw-alias-border-l1, #30363d)',
+    background: 'transparent',
+    color: 'inherit',
+    cursor: 'pointer',
+    fontSize: '11px',
+  },
+  actions: {
+    display: 'flex',
+    flexWrap: 'wrap',
+    gap: '4px',
+    marginTop: '4px',
   },
   main: {
     display: 'flex',
@@ -348,11 +367,12 @@ export default function createPlugin(requireFn: RequireFn) {
     const [isError, setIsError] = React.useState(false)
     const [dirty, setDirty] = React.useState(false)
     const [busy, setBusy] = React.useState(false)
+    const [forceOpen, setForceOpen] = React.useState(false)
 
     const editorHost = React.useRef<HTMLDivElement | null>(null)
     const editorView = React.useRef<EditorView | null>(null)
     const chapterText = React.useRef('')
-    const chapterSha = React.useRef('')
+    const chapterVersion = React.useRef('')
 
     const activeRoot = summary?.root ?? root
 
@@ -375,7 +395,7 @@ export default function createPlugin(requireFn: RequireFn) {
         `/deepsonder/chapter?root=${encodeURIComponent(projectRoot)}&id=${encodeURIComponent(id)}`,
       )
       chapterText.current = doc.raw
-      chapterSha.current = doc.sha256
+      chapterVersion.current = doc.version
       setChapter(doc)
       setChapterId(id)
       setEditorKey((value) => value + 1)
@@ -395,7 +415,7 @@ export default function createPlugin(requireFn: RequireFn) {
       try {
         const data = await api<ProjectSummary>('/deepsonder/project/open', {
           method: 'POST',
-          body: JSON.stringify({ root: input }),
+          body: JSON.stringify({ root: input, force: forceOpen }),
         })
         setSummary(data)
         setTrash(data.trash)
@@ -426,16 +446,16 @@ export default function createPlugin(requireFn: RequireFn) {
       if (!chapter) return
       setBusy(true)
       try {
-        const result = await api<{ sha256: string }>('/deepsonder/chapter/save', {
+        const result = await api<{ version: string }>('/deepsonder/chapter/save', {
           method: 'POST',
           body: JSON.stringify({
             root: activeRoot,
             id: chapter.id,
             raw: chapterText.current,
-            expectedSha: chapterSha.current,
+            expectedVersion: chapterVersion.current,
           }),
         })
-        chapterSha.current = result.sha256
+        chapterVersion.current = result.version
         setDirty(false)
         report(`已保存：${chapter.title}`)
         void refreshProject().catch(() => undefined)
@@ -468,16 +488,16 @@ export default function createPlugin(requireFn: RequireFn) {
       if (!canonDoc) return
       setBusy(true)
       try {
-        const result = await api<{ sha256: string }>('/deepsonder/canon/save', {
+        const result = await api<{ version: string }>('/deepsonder/canon/save', {
           method: 'POST',
           body: JSON.stringify({
             root: activeRoot,
             path: canonDoc.path,
             raw: canonDraft,
-            expectedSha: canonDoc.sha256,
+            expectedVersion: canonDoc.version,
           }),
         })
-        setCanonDoc({ ...canonDoc, raw: canonDraft, sha256: result.sha256 })
+        setCanonDoc({ ...canonDoc, raw: canonDraft, version: result.version })
         report(`已保存资料：${canonDoc.title}`)
         void refreshProject().catch(() => undefined)
       } catch (error) {
@@ -517,6 +537,111 @@ export default function createPlugin(requireFn: RequireFn) {
       }
     }
 
+    async function createNewChapter() {
+      const title = window.prompt('章节标题', '新章节')
+      if (!title?.trim()) return
+      setBusy(true)
+      try {
+        const created = await api<ChapterDoc>('/deepsonder/chapter/create', {
+          method: 'POST',
+          body: JSON.stringify({ root: activeRoot, title: title.trim() }),
+        })
+        const data = await refreshProject()
+        await loadChapter(created.id, data.root)
+        report(`已创建：${created.title}`)
+      } catch (error) {
+        report(errorMessage(error), true)
+      } finally {
+        setBusy(false)
+      }
+    }
+
+    async function renameChapter(id: string) {
+      const current = (summary?.chapters ?? []).find((item) => item.id === id)
+      const title = window.prompt('新的章节标题', current?.title ?? '')
+      if (!title?.trim()) return
+      setBusy(true)
+      try {
+        await api<ChapterDoc>('/deepsonder/chapter/rename', {
+          method: 'POST',
+          body: JSON.stringify({
+            root: activeRoot,
+            id,
+            title: title.trim(),
+            expectedVersion: current?.version,
+          }),
+        })
+        const data = await refreshProject()
+        if (chapterId === id) await loadChapter(id, data.root)
+        report('章节标题已更新')
+      } catch (error) {
+        report(errorMessage(error), true)
+      } finally {
+        setBusy(false)
+      }
+    }
+
+    async function deleteChapter(id: string) {
+      const current = (summary?.chapters ?? []).find((item) => item.id === id)
+      if (!window.confirm(`把「${current?.title ?? id}」移入回收站？`)) return
+      setBusy(true)
+      try {
+        await api<TrashEntry>('/deepsonder/chapter/delete', {
+          method: 'POST',
+          body: JSON.stringify({ root: activeRoot, id }),
+        })
+        const data = await refreshProject()
+        if (chapterId === id) {
+          setChapter(null)
+          setChapterId('')
+          chapterVersion.current = ''
+        }
+        setTab('trash')
+        await refreshTrash()
+        report(`已移入回收站：${current?.title ?? id}（项目：${data.name}）`)
+      } catch (error) {
+        report(errorMessage(error), true)
+      } finally {
+        setBusy(false)
+      }
+    }
+
+    async function moveChapter(id: string, direction: -1 | 1) {
+      const list = summary?.chapters ?? []
+      const index = list.findIndex((item) => item.id === id)
+      const target = index + direction
+      if (index < 0 || target < 0 || target >= list.length) return
+      const ids = list.map((item) => item.id)
+      const [moved] = ids.splice(index, 1)
+      if (!moved) return
+      ids.splice(target, 0, moved)
+
+      setBusy(true)
+      try {
+        const result = await api<{ chapters: ChapterSummary[] }>('/deepsonder/chapter/reorder', {
+          method: 'POST',
+          body: JSON.stringify({ root: activeRoot, orderedIds: ids }),
+        })
+        const data = await refreshProject()
+        if (chapterId) {
+          const selectedIndex = result.chapters.findIndex((item) => item.id === chapterId)
+          const selectedTitle = chapter?.title
+          const newIndex = selectedTitle
+            ? result.chapters.findIndex((item) => item.title === selectedTitle)
+            : selectedIndex
+          if (newIndex >= 0) {
+            const newId = `chapter_${String(newIndex + 1).padStart(2, '0')}`
+            await loadChapter(newId, data.root)
+          }
+        }
+        report('章节顺序已更新')
+      } catch (error) {
+        report(errorMessage(error), true)
+      } finally {
+        setBusy(false)
+      }
+    }
+
     function selectTab(next: 'chapters' | 'canon' | 'trash') {
       setTab(next)
       if (next === 'trash') void refreshTrash()
@@ -534,7 +659,7 @@ export default function createPlugin(requireFn: RequireFn) {
       })
       editorView.current = view
       chapterText.current = chapter.raw
-      chapterSha.current = chapter.sha256
+      chapterVersion.current = chapter.version
       return () => {
         view.destroy()
         if (editorView.current === view) editorView.current = null
@@ -570,6 +695,23 @@ export default function createPlugin(requireFn: RequireFn) {
           'button',
           { style: STYLES.primary, onClick: () => void openProject(), disabled: busy },
           '打开项目',
+        ),
+        h(
+          'label',
+          {
+            style: {
+              ...STYLES.meta,
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: '4px',
+            },
+          },
+          h('input', {
+            type: 'checkbox',
+            checked: forceOpen,
+            onChange: (event: any) => setForceOpen(event.target.checked),
+          }),
+          '强制打开',
         ),
         h('span', { style: STYLES.meta }, projectName),
         h('div', { style: { flex: '1 1 auto' } }),
@@ -616,18 +758,75 @@ export default function createPlugin(requireFn: RequireFn) {
             ? h(
                 'div',
                 { style: STYLES.list },
+                h(
+                  'button',
+                  {
+                    style: STYLES.primary,
+                    onClick: () => void createNewChapter(),
+                    disabled: busy || !summary,
+                  },
+                  '新建章节',
+                ),
                 chapters.length === 0
                   ? h('div', { style: STYLES.hint }, summary ? '该项目暂无章节。' : '先打开一个项目。')
                   : chapters.map((item) =>
                       h(
-                        'button',
+                        'div',
                         {
                           key: item.id,
-                          style: chapterId === item.id ? STYLES.itemActive : STYLES.item,
-                          onClick: () => void loadChapter(item.id),
+                          style: { display: 'flex', flexDirection: 'column', gap: '2px' },
                         },
-                        h('div', null, item.title),
-                        h('div', { style: STYLES.meta }, item.id),
+                        h(
+                          'button',
+                          {
+                            style: chapterId === item.id ? STYLES.itemActive : STYLES.item,
+                            onClick: () => void loadChapter(item.id),
+                          },
+                          h('div', null, item.title),
+                          h('div', { style: STYLES.meta }, item.id),
+                        ),
+                        h(
+                          'div',
+                          { style: STYLES.actions },
+                          h(
+                            'button',
+                            {
+                              style: STYLES.mini,
+                              onClick: () => void moveChapter(item.id, -1),
+                              disabled: busy,
+                              title: '上移',
+                            },
+                            '↑',
+                          ),
+                          h(
+                            'button',
+                            {
+                              style: STYLES.mini,
+                              onClick: () => void moveChapter(item.id, 1),
+                              disabled: busy,
+                              title: '下移',
+                            },
+                            '↓',
+                          ),
+                          h(
+                            'button',
+                            {
+                              style: STYLES.mini,
+                              onClick: () => void renameChapter(item.id),
+                              disabled: busy,
+                            },
+                            '改名',
+                          ),
+                          h(
+                            'button',
+                            {
+                              style: STYLES.mini,
+                              onClick: () => void deleteChapter(item.id),
+                              disabled: busy,
+                            },
+                            '删除',
+                          ),
+                        ),
                       ),
                     ),
               )
