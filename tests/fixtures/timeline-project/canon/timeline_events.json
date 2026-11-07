@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "events": [
+    {
+      "id": "event-1",
+      "deleted": false,
+      "title": "测试事件",
+      "description": "",
+      "time": "第一天",
+      "characters": "",
+      "location": "",
+      "storyline": "",
+      "state": "planned",
+      "major": false,
+      "chapter_ids": []
+    }
+  ],
+  "selections": {}
+}
